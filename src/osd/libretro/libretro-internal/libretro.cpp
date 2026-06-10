@@ -36,6 +36,14 @@ static bool libretro_supports_option_categories = false;
 bool libretro_supports_ff_override = false;
 bool libretro_ff_enabled = false;
 
+/* Bit 0 = Video, Bit 1 = Audio. Default to 3 (both enabled). */
+static int audio_video_enable = 3;
+static int frames_since_boot = 0;
+#define WARMUP_FRAMES 120 // 2 seconds at 60fps
+
+// A small dummy buffer to satisfy early RetroArch serialization requests
+static uint8_t warmup_dummy_buffer[1024] = { 0 };
+
 int fb_width       = 640;
 int fb_height      = 480;
 int max_width      = 720;
@@ -179,7 +187,7 @@ static void upload_output_audio_buffer()
 
 void retro_audio_queue(const int16_t *data, int32_t samples)
 {
-   if ((samples < 1) || retro_pause)
+   if ((samples < 1) || retro_pause || !(audio_video_enable & 2))
       return;
 
    if (output_audio_buffer.capacity - output_audio_buffer.size < samples)
@@ -869,12 +877,44 @@ void retro_run(void)
 {
    bool updated = false;
 
+   /* 1. Handle configuration updates */
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
       check_variables();
       update_runtime_variables(false);
    }
 
+   /* 2. Warmup State Machine */
+   if (frames_since_boot < WARMUP_FRAMES)
+   {
+      /* FORCE "Normal" mode */
+      audio_video_enable = 3;
+      frames_since_boot++;
+   }
+   else 
+   {
+      /* Optimization Mode: Check environment every frame */
+      int av_enable = 0;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av_enable))
+         audio_video_enable = av_enable;
+      else
+         audio_video_enable = 3;    
+   }
+
+   /* 3. Deep Optimization (Gate the Skip) */
+   /* Only trigger internal skip if we are past the warmup phase */
+   if (frames_since_boot >= WARMUP_FRAMES)
+   {
+      if (mame_machine_manager::instance() != NULL && mame_machine_manager::instance()->machine() != NULL)
+      {
+         if ((audio_video_enable & 1) == 0)
+         {
+            mame_machine_manager::instance()->machine()->video().skip_this_frame();
+         }
+      }
+   }
+
+   // 4. Execution
    if (!retro_pause)
       retro_main_loop();
    RLOOP = 1;
@@ -894,16 +934,32 @@ void retro_run(void)
       draw_this_frame = false;
    }
 
-//FIXME: re-add way to handle OGL
+   //FIXME: re-add way to handle OGL
+   // 5. Video/Audio Output (Gate the output)
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
-   do_glflush();
+   if (audio_video_enable & 1)
+      do_glflush();
 #else
-   if (draw_this_frame)
-      video_cb(videoBuffer, fb_width, fb_height, fb_width << LOG_PIXEL_BYTES);
-   else
-      video_cb(NULL, fb_width, fb_height, fb_width << LOG_PIXEL_BYTES);
+   // Always draw during warmup; skip only after warmup
+   if ((audio_video_enable & 1) || (frames_since_boot < WARMUP_FRAMES))
+   {
+      if (draw_this_frame)
+         video_cb(videoBuffer, fb_width, fb_height, fb_width << LOG_PIXEL_BYTES);
+      else
+         video_cb(NULL, fb_width, fb_height, fb_width << LOG_PIXEL_BYTES);
+   }
 #endif
-   upload_output_audio_buffer();
+   // Audio Output
+   if ((audio_video_enable & 2) || (frames_since_boot < WARMUP_FRAMES))
+   {
+      upload_output_audio_buffer();
+   }
+   else
+   {
+      /* Prevent buffer buildup and desyncs during runahead */
+      output_audio_buffer.size = 0;
+      audio_ready = false;
+   }
 
    if (video_changed == VIDEO_CHANGED_AV_INFO)
       update_av_info();
@@ -979,35 +1035,74 @@ void retro_unload_game(void)
 
 size_t retro_serialize_size(void)
 {
-   if (     mame_machine_manager::instance() != NULL
-	      && mame_machine_manager::instance()->machine() != NULL
-	      && ram_state::get_size(mame_machine_manager::instance()->machine()->save()) > 0)
-      return ram_state::get_size(mame_machine_manager::instance()->machine()->save());
-
+   if (mame_machine_manager::instance() != NULL
+       && mame_machine_manager::instance()->machine() != NULL)
+   {
+      size_t base_size = ram_state::get_size(mame_machine_manager::instance()->machine()->save());
+      
+      if (base_size > 0)
+      {
+         /* MAME dynamically allocates memory during boot. 
+          * We MUST pad the initial size request so RetroArch allocates 
+          * a buffer large enough to hold the fully-booted machine state. */
+         return base_size + (1024 * 1024 * 8); // +8MB Padding
+      }
+   }
    return 0;
 }
 bool retro_serialize(void *data, size_t size)
 {
    save_error error = STATERR_NOT_FOUND;
-   if (     mame_machine_manager::instance() != NULL
-	      && mame_machine_manager::instance()->machine() != NULL
-	      && ram_state::get_size(mame_machine_manager::instance()->machine()->save()) > 0)
-      error = mame_machine_manager::instance()->machine()->save().write_buffer((u8*)data, size);
+   
+   if (mame_machine_manager::instance() != NULL
+       && mame_machine_manager::instance()->machine() != NULL)
+   {
+      size_t current_size = ram_state::get_size(mame_machine_manager::instance()->machine()->save());
+      
+      /* Verify the state hasn't outgrown our padded buffer before writing */
+      if (current_size > 0 && current_size <= size)
+      {
+         /* FIX: Pass 'current_size' to MAME so it matches the exact state size,
+          * rather than passing RetroArch's padded 'size'. */
+         error = mame_machine_manager::instance()->machine()->save().write_buffer((u8*)data, current_size);
+      }
+      else if (current_size > size)
+      {
+         log_cb(RETRO_LOG_ERROR, "Buffer overflow prevented! State needs %zu, but only %zu allocated.\n", current_size, size);
+         return false; 
+      }
+   }
 
    if (error != STATERR_NONE)
       log_cb(RETRO_LOG_ERROR, "State save error %d.\n", error);
+      
    return (error == STATERR_NONE);
 }
 bool retro_unserialize(const void *data, size_t size)
 {
+   /* Phantom Rollback: Protect MAME's boot clocks */
+   if (frames_since_boot < WARMUP_FRAMES)
+   {
+      return true;
+   }
+
    save_error error = STATERR_NOT_FOUND;
-   if (     mame_machine_manager::instance() != NULL
-         && mame_machine_manager::instance()->machine() != NULL
-         &&	ram_state::get_size(mame_machine_manager::instance()->machine()->save()) > 0)
-      error = mame_machine_manager::instance()->machine()->save().read_buffer((u8*)data, size);
+   
+   if (mame_machine_manager::instance() != NULL
+       && mame_machine_manager::instance()->machine() != NULL)
+   {
+      size_t current_size = ram_state::get_size(mame_machine_manager::instance()->machine()->save());
+      
+      /* FIX: Read exactly 'current_size' bytes back from the padded buffer */
+      if (current_size > 0 && current_size <= size)
+      {
+         error = mame_machine_manager::instance()->machine()->save().read_buffer((u8*)data, current_size);
+      }
+   }
 
    if (error != STATERR_NONE)
       log_cb(RETRO_LOG_ERROR, "State load error %d.\n", error);
+      
    return (error == STATERR_NONE);
 }
 
