@@ -51,6 +51,9 @@ static bool draw_this_frame = true;
 static int maincpu_overclock = 100;
 static int soundcpu_overclock = 100;
 
+static int frames_since_boot = 0;
+unsigned int warmup_frames = 0;
+
 const char *retro_save_directory;
 const char *retro_system_directory;
 const char *retro_content_directory;
@@ -540,6 +543,15 @@ static void check_variables(void)
          soundcpu_overclock = atoi(var.value);
    }
 
+   var.key   = CORE_NAME "_frames_to_delay_runahead";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      warmup_frames = 0;
+      if (strcmp(var.value, "default"))
+         warmup_frames = atoi(var.value);
+   }
+
    var.key   = CORE_NAME "_autoloadfastforward";
    var.value = NULL;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -874,6 +886,11 @@ void retro_run(void)
       update_runtime_variables(false);
    }
 
+   if (frames_since_boot < warmup_frames)
+   {
+      frames_since_boot++;
+   }
+
    if (!retro_pause)
       retro_main_loop();
    RLOOP = 1;
@@ -999,6 +1016,12 @@ bool retro_serialize(void *data, size_t size)
 }
 bool retro_unserialize(const void *data, size_t size)
 {
+   /* Phantom Rollback: Protect MAME's boot clocks */
+   if (frames_since_boot < warmup_frames)
+   {
+      return true;
+   }
+
    save_error error = STATERR_NOT_FOUND;
    if (     mame_machine_manager::instance() != NULL
          && mame_machine_manager::instance()->machine() != NULL
